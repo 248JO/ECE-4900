@@ -1,14 +1,24 @@
 
-const int LED_PIN = 26;
+#include "pico/stdlib.h"
 
-void setup() {
-  pinMode(LED_PIN, OUTPUT);
-}
+#define LED_PIN 26
 
-void loop() {
-  digitalWrite(LED_PIN, HIGH);
-  delay(1000);  // LED ON for 1 second
+int main() {
+    // Initialize GPIO26
+    gpio_init(LED_PIN);
 
-  digitalWrite(LED_PIN, LOW);
-  delay(1000);  // LED OFF for 1 second
+    // Set GPIO26 as output
+    gpio_set_dir(LED_PIN, GPIO_OUT);
+
+    while (true) {
+        // Turn LED ON
+        gpio_put(LED_PIN, 1);
+        sleep_ms(1000);
+
+        // Turn LED OFF
+        gpio_put(LED_PIN, 0);
+        sleep_ms(1000);
+    }
+
+    return 0;
 }
