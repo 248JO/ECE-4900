@@ -1,107 +1,682 @@
+// VERSION 2: EXACT STEP-COUNT MOVEMENT ON X, Y, Z.
+// The original homing movement functions and MIN->MAX->MIN axis order are kept.
+// Based on the working 200 pulses/rev, 150 RPM controller.
+// Set TB6600 DIP switches for 200 pulses/revolution for a 200-full-step motor.
+// X has two motors that both receive the same pulse; Y and Z have one each.
+// Serial command changes to X(pulses),Y(pulses),Z(pulses).
+// Y commanded movement now uses stepY() pulses rather than continuous PWM.
+
 #include <Arduino.h>
+#include <stdlib.h>
+#include <errno.h>
 
-const int STEP_PIN = 4;   // A4988 STEP -> ESP32 D4 / GPIO 4
-const int DIR_PIN  = 2;   // A4988 DIR  -> ESP32 D2 / GPIO 2
+// =====================================================
+// X AXIS: Motors 1 and 2 move together
+// =====================================================
+const int X_DIR_PIN  = 16;
+const int X_PUL1_PIN = 17;
+const int X_PUL2_PIN = 4;
 
-const int LIMIT_1_PIN = 5;    // First/home-side limit switch
-const int LIMIT_2_PIN = 18;   // Second/opposite-side limit switch
+const int X_MIN_SWITCH = 2;   // GP2 = X home
+const int X_MAX_SWITCH = 3;   // GP3 = X maximum
 
-const int STEP_INTERVAL_US = 10000;  // 30 RPM in full-step mode
-const int NUMBER_OF_PORTIONS = 100;
+// =====================================================
+// Y AXIS: Motor 3
+// =====================================================
+const int Y_DIR_PIN = 15;
+const int Y_PUL_PIN = 14;
 
-// For NC wiring: normal = LOW; touched/open = HIGH
-bool limitTouched(int pin) {
-  return digitalRead(pin) == HIGH;
+const int Y_MIN_SWITCH = 7;   // GP7 = Y home
+const int Y_MAX_SWITCH = 8;   // GP8 = Y maximum
+
+// =====================================================
+// Z AXIS: Motor 4
+// =====================================================
+const int Z_PUL_PIN = 9;
+const int Z_DIR_PIN = 10;
+
+const int Z_MIN_SWITCH = 11;  // GP11 = Z home
+const int Z_MAX_SWITCH = 12;  // GP12 = Z maximum
+
+// =====================================================
+// Motion settings
+// =====================================================
+
+// Must match the TB6600 DIP-switch pulse/revolution setting.
+const int PULSES_PER_REV = 200;
+
+// Start low and increase later only if motion stays reliable.
+const int RPM = 150;
+
+const unsigned long PULSE_FREQUENCY =
+(RPM * PULSES_PER_REV) / 60;
+
+const unsigned long STEP_PERIOD_US =
+1000000UL / PULSE_FREQUENCY;
+
+const unsigned long PULSE_WIDTH_US = 10;
+
+const unsigned long TRAVEL_TIMEOUT_MS = 30000;
+const unsigned long INPUT_DELAY_MS = 3000;
+
+// Change HIGH/LOW if an axis moves away from the intended switch.
+const int X_DIRECTION_TO_MIN = HIGH;
+const int X_DIRECTION_TO_MAX = LOW;
+
+const int Y_DIRECTION_TO_MIN = HIGH;
+const int Y_DIRECTION_TO_MAX = LOW;
+
+const int Z_DIRECTION_TO_MIN = HIGH;
+const int Z_DIRECTION_TO_MAX = LOW;
+
+// =====================================================
+// Measured travel time (for diagnostics) and step travel range.
+// Homing movement and order are unchanged from the working code.
+// =====================================================
+unsigned long xMaxTimeMs = 0;
+unsigned long yMaxTimeMs = 0;
+unsigned long zMaxTimeMs = 0;
+unsigned long xMaxSteps = 0;
+unsigned long yMaxSteps = 0;
+unsigned long zMaxSteps = 0;
+
+// Only enabled during each MIN -> MAX calibration pass.
+bool countingXCalibration = false;
+bool countingYCalibration = false;
+bool countingZCalibration = false;
+
+// Relative commanded positions, in DRIVER PULSES from home.
+long currentXSteps = 0;
+long currentYSteps = 0;
+long currentZSteps = 0;
+
+String inputBuffer = "";
+
+// Sample 1: absolute starting position, followed by the scan increments.
+const long SAMPLE_1_START_X = 500;
+const long SAMPLE_1_START_Y = 500;
+const long SAMPLE_1_START_Z = 0;
+const long SAMPLE_1_INCREMENT = 106;
+const long SAMPLE_1_SECOND_GRID_X_OFFSET = -240;
+const unsigned long SAMPLE_1_WAIT_MS = 500;
+const int SAMPLE_1_X_INCREMENTS = 10;
+const int SAMPLE_1_Y_INCREMENTS = 10;
+
+// NPN photoelectric switch: LOW = triggered
+bool isTriggered(int switchPin) {
+return digitalRead(switchPin) == LOW;
 }
 
-void takeOneStep() {
-  digitalWrite(STEP_PIN, HIGH);
-  delayMicroseconds(5);
-  digitalWrite(STEP_PIN, LOW);
-  delayMicroseconds(STEP_INTERVAL_US - 5);
+void stopAll() {
+digitalWrite(X_PUL1_PIN, LOW);
+digitalWrite(X_PUL2_PIN, LOW);
+digitalWrite(Y_PUL_PIN, LOW);
+digitalWrite(Z_PUL_PIN, LOW);
 }
 
-void stopForever() {
-  while (true) {
-    delay(1000);  // Motor remains stopped here
+void stepX() {
+digitalWrite(X_PUL1_PIN, HIGH);
+digitalWrite(X_PUL2_PIN, HIGH);
+delayMicroseconds(PULSE_WIDTH_US);
+
+digitalWrite(X_PUL1_PIN, LOW);
+digitalWrite(X_PUL2_PIN, LOW);
+if (countingXCalibration) ++xMaxSteps;
+}
+
+void stepY() {
+digitalWrite(Y_PUL_PIN, HIGH);
+delayMicroseconds(PULSE_WIDTH_US);
+digitalWrite(Y_PUL_PIN, LOW);
+if (countingYCalibration) ++yMaxSteps;
+}
+
+void stepZ() {
+digitalWrite(Z_PUL_PIN, HIGH);
+delayMicroseconds(PULSE_WIDTH_US);
+digitalWrite(Z_PUL_PIN, LOW);
+if (countingZCalibration) ++zMaxSteps;
+}
+
+// =====================================================
+// Move toward one specific limit switch
+// Used for homing and initial travel-time measurement.
+// =====================================================
+bool moveXUntilSwitch(int targetSwitch, int direction,
+unsigned long &elapsedMs) {
+digitalWrite(X_DIR_PIN, direction);
+delay(10);
+
+unsigned long startTime = millis();
+
+while (!isTriggered(targetSwitch)) {
+if (millis() - startTime > TRAVEL_TIMEOUT_MS) {
+stopAll();
+Serial.println("ERROR: X timeout.");
+return false;
+}
+
+stepX();
+delayMicroseconds(STEP_PERIOD_US - PULSE_WIDTH_US);
+
+}
+
+elapsedMs = millis() - startTime;
+
+digitalWrite(X_PUL1_PIN, LOW);
+digitalWrite(X_PUL2_PIN, LOW);
+return true;
+}
+
+bool moveYUntilSwitch(int targetSwitch, int direction,
+unsigned long &elapsedMs) {
+digitalWrite(Y_DIR_PIN, direction);
+delay(10);
+
+unsigned long startTime = millis();
+
+while (!isTriggered(targetSwitch)) {
+if (millis() - startTime > TRAVEL_TIMEOUT_MS) {
+stopAll();
+Serial.println("ERROR: Y timeout.");
+return false;
+}
+
+stepY();
+delayMicroseconds(STEP_PERIOD_US - PULSE_WIDTH_US);
+
+}
+
+elapsedMs = millis() - startTime;
+
+digitalWrite(Y_PUL_PIN, LOW);
+return true;
+}
+
+bool moveZUntilSwitch(int targetSwitch, int direction,
+unsigned long &elapsedMs) {
+digitalWrite(Z_DIR_PIN, direction);
+delay(10);
+
+unsigned long startTime = millis();
+
+while (!isTriggered(targetSwitch)) {
+if (millis() - startTime > TRAVEL_TIMEOUT_MS) {
+stopAll();
+Serial.println("ERROR: Z timeout.");
+return false;
+}
+
+stepZ();
+delayMicroseconds(STEP_PERIOD_US - PULSE_WIDTH_US);
+
+}
+
+elapsedMs = millis() - startTime;
+
+digitalWrite(Z_PUL_PIN, LOW);
+return true;
+}
+
+// =====================================================
+// Home each axis
+// =====================================================
+bool homeX() {
+unsigned long ignoredTime = 0;
+
+Serial.println("Homing X to GP2...");
+if (!moveXUntilSwitch(X_MIN_SWITCH, X_DIRECTION_TO_MIN, ignoredTime)) {
+return false;
+}
+
+currentXSteps = 0;
+Serial.println("X homed.");
+delay(500);
+return true;
+}
+
+bool homeY() {
+unsigned long ignoredTime = 0;
+
+Serial.println("Homing Y to GP7...");
+if (!moveYUntilSwitch(Y_MIN_SWITCH, Y_DIRECTION_TO_MIN, ignoredTime)) {
+return false;
+}
+
+currentYSteps = 0;
+Serial.println("Y homed.");
+delay(500);
+return true;
+}
+
+bool homeZ() {
+unsigned long ignoredTime = 0;
+
+Serial.println("Homing Z to GP11...");
+if (!moveZUntilSwitch(Z_MIN_SWITCH, Z_DIRECTION_TO_MIN, ignoredTime)) {
+return false;
+}
+
+currentZSteps = 0;
+Serial.println("Z homed.");
+delay(500);
+return true;
+}
+
+// =====================================================
+// Measure the travel time from home/minimum to maximum,
+// then return the axis home.
+// =====================================================
+bool calibrateTravelTimes() {
+if (!homeX()) return false;
+
+Serial.println("Measuring X: GP2 to GP3...");
+xMaxSteps = 0;
+countingXCalibration = true;
+bool xMeasured = moveXUntilSwitch(
+X_MAX_SWITCH, X_DIRECTION_TO_MAX, xMaxTimeMs);
+countingXCalibration = false;
+if (!xMeasured) return false;
+if (xMaxSteps == 0) {
+Serial.println("ERROR: X calibrated to zero pulses.");
+return false;
+}
+
+if (xMaxTimeMs == 0) {
+Serial.println("ERROR: X travel time measured as zero.");
+return false;
+}
+
+Serial.print("X full travel time: ");
+Serial.print(xMaxTimeMs);
+Serial.println(" ms");
+Serial.print("X full travel pulses: ");
+Serial.println(xMaxSteps);
+
+if (!homeX()) return false;
+
+if (!homeY()) return false;
+
+Serial.println("Measuring Y: GP7 to GP8...");
+yMaxSteps = 0;
+countingYCalibration = true;
+bool yMeasured = moveYUntilSwitch(
+Y_MAX_SWITCH, Y_DIRECTION_TO_MAX, yMaxTimeMs);
+countingYCalibration = false;
+if (!yMeasured) return false;
+if (yMaxSteps == 0) {
+Serial.println("ERROR: Y calibrated to zero pulses.");
+return false;
+}
+
+if (yMaxTimeMs == 0) {
+Serial.println("ERROR: Y travel time measured as zero.");
+return false;
+}
+
+Serial.print("Y full travel time: ");
+Serial.print(yMaxTimeMs);
+Serial.println(" ms");
+Serial.print("Y full travel pulses: ");
+Serial.println(yMaxSteps);
+
+if (!homeY()) return false;
+
+if (!homeZ()) return false;
+
+Serial.println("Measuring Z: GP11 to GP12...");
+zMaxSteps = 0;
+countingZCalibration = true;
+bool zMeasured = moveZUntilSwitch(
+Z_MAX_SWITCH, Z_DIRECTION_TO_MAX, zMaxTimeMs);
+countingZCalibration = false;
+if (!zMeasured) return false;
+if (zMaxSteps == 0) {
+Serial.println("ERROR: Z calibrated to zero pulses.");
+return false;
+}
+
+if (zMaxTimeMs == 0) {
+Serial.println("ERROR: Z travel time measured as zero.");
+return false;
+}
+
+Serial.print("Z full travel time: ");
+Serial.print(zMaxTimeMs);
+Serial.println(" ms");
+Serial.print("Z full travel pulses: ");
+Serial.println(zMaxSteps);
+
+if (!homeZ()) return false;
+
+return true;
+}
+
+// =====================================================
+// VERSION 2: commanded movements by COUNTED DRIVER PULSES.
+// Uses the SAME stepX/stepY/stepZ functions and pulse timing as homing.
+// The Y hardware PWM is not used in this version, because time-limited
+// PWM cannot guarantee an exact integer number of step pulses.
+// =====================================================
+
+typedef void (*StepFn)();
+
+bool moveAxisForSteps(const char* axisName,
+int dirPin, int minSwitch, int maxSwitch,
+int dirToMin, int dirToMax,
+long &currentSteps, unsigned long maxSteps,
+long requestedSignedSteps, StepFn stepFn) {
+if (requestedSignedSteps == 0) return true;
+
+const bool towardMax = requestedSignedSteps > 0;
+// int64_t prevents overflow when negating LONG_MIN on a 32-bit board.
+const unsigned long pulseCount = towardMax
+? (unsigned long)requestedSignedSteps
+: (unsigned long)(-(int64_t)requestedSignedSteps);
+
+const int64_t target =
+(int64_t)currentSteps + (int64_t)requestedSignedSteps;
+if (target < 0 || target > (int64_t)maxSteps) {
+Serial.print("ERROR: "); Serial.print(axisName);
+Serial.println(" target outside calibrated travel.");
+return false;
+}
+
+// Never drive farther INTO an already-active end switch.
+if ((towardMax && isTriggered(maxSwitch)) ||
+(!towardMax && isTriggered(minSwitch)) ||
+(isTriggered(minSwitch) && isTriggered(maxSwitch))) {
+Serial.print("ERROR: "); Serial.print(axisName);
+Serial.println(" requested direction blocked by switch.");
+return false;
+}
+
+digitalWrite(dirPin, towardMax ? dirToMax : dirToMin);
+delay(10);  // Same direction setup as homing.
+
+// We allow moving AWAY from an already-active switch.
+bool minWasClear = !isTriggered(minSwitch);
+bool maxWasClear = !isTriggered(maxSwitch);
+const unsigned long startedAt = millis();
+
+for (unsigned long i = 0; i < pulseCount; ++i) {
+if (millis() - startedAt > TRAVEL_TIMEOUT_MS) {
+stopAll();
+Serial.print("ERROR: "); Serial.print(axisName);
+Serial.println(" step movement timed out. Re-home before continuing.");
+return false;
+}
+
+// Exit immediately if a limit newly becomes active.
+if ((minWasClear && isTriggered(minSwitch)) ||
+    (maxWasClear && isTriggered(maxSwitch))) {
+  stopAll();
+  if (isTriggered(minSwitch)) currentSteps = 0;
+  if (isTriggered(maxSwitch)) currentSteps = (long)maxSteps;
+  Serial.print("STOP: "); Serial.print(axisName);
+  Serial.println(" switch triggered during command.");
+  return false;
+}
+
+stepFn();  // X sends one pulse to BOTH X motors; Y and Z each pulse once.
+currentSteps += towardMax ? 1L : -1L;
+
+if (!isTriggered(minSwitch)) minWasClear = true;
+if (!isTriggered(maxSwitch)) maxWasClear = true;
+
+delayMicroseconds(STEP_PERIOD_US - PULSE_WIDTH_US);
+
+// Check even after the LAST pulse of the commanded movement.
+if ((minWasClear && isTriggered(minSwitch)) ||
+    (maxWasClear && isTriggered(maxSwitch))) {
+  stopAll();
+  if (isTriggered(minSwitch)) currentSteps = 0;
+  if (isTriggered(maxSwitch)) currentSteps = (long)maxSteps;
+  Serial.print("STOP: "); Serial.print(axisName);
+  Serial.println(" switch triggered; position set to endpoint.");
+  return false;
+}
+
+}
+stopAll();
+return true;
+}
+
+bool moveXForSteps(long steps) {
+return moveAxisForSteps("X", X_DIR_PIN, X_MIN_SWITCH, X_MAX_SWITCH,
+X_DIRECTION_TO_MIN, X_DIRECTION_TO_MAX,
+currentXSteps, xMaxSteps, steps, stepX);
+}
+
+bool moveYForSteps(long steps) {
+return moveAxisForSteps("Y", Y_DIR_PIN, Y_MIN_SWITCH, Y_MAX_SWITCH,
+Y_DIRECTION_TO_MIN, Y_DIRECTION_TO_MAX,
+currentYSteps, yMaxSteps, steps, stepY);
+}
+
+bool moveZForSteps(long steps) {
+return moveAxisForSteps("Z", Z_DIR_PIN, Z_MIN_SWITCH, Z_MAX_SWITCH,
+Z_DIRECTION_TO_MIN, Z_DIRECTION_TO_MAX,
+currentZSteps, zMaxSteps, steps, stepZ);
+}
+
+// Move to an absolute, calibrated position. Normal serial commands remain
+// relative; this is only used by the Sample 1 shortcut.
+bool moveToPosition(long targetX, long targetY, long targetZ) {
+if (targetX < 0 || targetX > (long)xMaxSteps ||
+targetY < 0 || targetY > (long)yMaxSteps ||
+targetZ < 0 || targetZ > (long)zMaxSteps) {
+Serial.println("ERROR: Sample 1 start position outside calibrated travel.");
+return false;
+}
+
+bool ok = moveXForSteps(targetX - currentXSteps);
+if (ok) ok = moveYForSteps(targetY - currentYSteps);
+if (ok) ok = moveZForSteps(targetZ - currentZSteps);
+return ok;
+}
+
+// Run one serpentine grid. Odd rows move X toward maximum; even rows move
+// X toward home. Each row ends with one positive Y increment.
+bool runSample1Grid(int gridNumber) {
+for (int yIncrement = 1; yIncrement <= SAMPLE_1_Y_INCREMENTS; ++yIncrement) {
+const long xStep = (yIncrement % 2 == 1)
+? SAMPLE_1_INCREMENT
+: -SAMPLE_1_INCREMENT;
+Serial.print("Sample 1, grid "); Serial.print(gridNumber);
+Serial.print(", row "); Serial.print(yIncrement);
+Serial.println(xStep > 0 ? " - moving X toward maximum..."
+: " - moving X toward home...");
+
+for (int xIncrement = 1; xIncrement <= SAMPLE_1_X_INCREMENTS; ++xIncrement) {
+  const long nextX = currentXSteps + xStep;
+  if (nextX < 0 || nextX > (long)xMaxSteps) {
+    Serial.print("Sample 1, grid "); Serial.print(gridNumber);
+    Serial.print(", row "); Serial.print(yIncrement);
+    Serial.print(", X increment "); Serial.print(xIncrement);
+    Serial.println(" rejected: would exceed X travel range.");
+    return false;
   }
+  if (!moveXForSteps(xStep)) return false;
+  delay(SAMPLE_1_WAIT_MS);
+}
+
+if (currentYSteps + SAMPLE_1_INCREMENT > (long)yMaxSteps) {
+  Serial.print("Sample 1, grid "); Serial.print(gridNumber);
+  Serial.print(": Y increment "); Serial.print(yIncrement);
+  Serial.println(" rejected: would exceed Y maximum.");
+  return false;
+}
+if (!moveYForSteps(SAMPLE_1_INCREMENT)) return false;
+delay(SAMPLE_1_WAIT_MS);
+
+}
+
+return true;
+}
+
+// Sample 1 runs one serpentine grid, returns Y to the original start line,
+// shifts X +240 pulses, then runs the same serpentine grid again.
+bool runSample1() {
+Serial.println("Sample 1: moving to X=1025, Y=450, Z=0...");
+if (!moveToPosition(SAMPLE_1_START_X, SAMPLE_1_START_Y, SAMPLE_1_START_Z)) {
+Serial.println("Sample 1 stopped before scan start.");
+return false;
+}
+
+Serial.println("Sample 1: starting first grid...");
+if (!runSample1Grid(1)) return false;
+
+Serial.println("Sample 1: returning Y to the original start line...");
+if (!moveYForSteps(SAMPLE_1_START_Y - currentYSteps)) return false;
+delay(SAMPLE_1_WAIT_MS);
+
+const long secondGridStartX = currentXSteps + SAMPLE_1_SECOND_GRID_X_OFFSET;
+if (secondGridStartX < 0 || secondGridStartX > (long)xMaxSteps) {
+Serial.println("Sample 1: second-grid X offset rejected: outside X travel range.");
+return false;
+}
+Serial.println("Sample 1: shifting X +240 pulses for the second grid...");
+if (!moveXForSteps(SAMPLE_1_SECOND_GRID_X_OFFSET)) return false;
+delay(SAMPLE_1_WAIT_MS);
+
+Serial.println("Sample 1: starting second grid...");
+if (!runSample1Grid(2)) return false;
+
+Serial.println("Sample 1 complete.");
+return true;
+}
+
+void printPrompt() {
+Serial.println();
+Serial.println("========== STEP POSITION ==========");
+Serial.print("X = "); Serial.print(currentXSteps);
+Serial.print(" pulses, maximum = "); Serial.println(xMaxSteps);
+Serial.print("Y = "); Serial.print(currentYSteps);
+Serial.print(" pulses, maximum = "); Serial.println(yMaxSteps);
+Serial.print("Z = "); Serial.print(currentZSteps);
+Serial.print(" pulses, maximum = "); Serial.println(zMaxSteps);
+Serial.println("===================================");
+Serial.println("Enter RELATIVE driver pulses: X,Y,Z");
+Serial.println("Example: 0,20,0 or 100,-50,25");
+Serial.println("Enter 1 to run Sample 1: two serpentine grids; grid 2 starts 240 pulses higher in X.");
+Serial.println("Positive = toward maximum; negative = toward home.");
+Serial.println("X moves first, then Y, then Z.");
+Serial.print("> ");
+}
+
+bool parseSignedSteps(const String &text, long &result) {
+if (text.length() == 0) return false;
+errno = 0;
+char *end = nullptr;
+long parsed = strtol(text.c_str(), &end, 10);
+if (errno == ERANGE || *end != '\0') return false;
+result = parsed;
+return true;
 }
 
 void setup() {
-  pinMode(STEP_PIN, OUTPUT);
-  pinMode(DIR_PIN, OUTPUT);
+Serial.begin(115200);
+delay(5000);
 
-  pinMode(LIMIT_1_PIN, INPUT_PULLUP);
-  pinMode(LIMIT_2_PIN, INPUT_PULLUP);
+pinMode(X_DIR_PIN, OUTPUT);
+pinMode(X_PUL1_PIN, OUTPUT);
+pinMode(X_PUL2_PIN, OUTPUT);
+pinMode(Y_DIR_PIN, OUTPUT);
+pinMode(Y_PUL_PIN, OUTPUT);
+pinMode(Z_DIR_PIN, OUTPUT);
+pinMode(Z_PUL_PIN, OUTPUT);
 
-  digitalWrite(STEP_PIN, LOW);
+// NPN sensors: external 10 kOhm pull-ups to 3.3 V required.
+pinMode(X_MIN_SWITCH, INPUT);
+pinMode(X_MAX_SWITCH, INPUT);
+pinMode(Y_MIN_SWITCH, INPUT);
+pinMode(Y_MAX_SWITCH, INPUT);
+pinMode(Z_MIN_SWITCH, INPUT);
+pinMode(Z_MAX_SWITCH, INPUT);
 
-  // ------------------------------------------------
-  // 1. Home to the first limit switch: D5
-  // ------------------------------------------------
-  digitalWrite(DIR_PIN, HIGH);  // Change both directions if needed
+stopAll();
+Serial.println();
+Serial.println("Starting original X->Y->Z homing/calibration, counting pulses...");
 
-  while (!limitTouched(LIMIT_1_PIN)) {
-    takeOneStep();
-  }
+if (!calibrateTravelTimes()) {
+stopAll();
+Serial.println("ERROR: Calibration failed. Motors stopped.");
+while (true) { delay(1000); }
+}
 
-  delay(1000);  // Stay at the first switch for 1 second
-
-  // ------------------------------------------------
-  // 2. Move to D18 and count the travel distance
-  // ------------------------------------------------
-  digitalWrite(DIR_PIN, LOW);
-
-  long stepsBetweenLimits = 0;
-
-  while (!limitTouched(LIMIT_2_PIN)) {
-    takeOneStep();
-    stepsBetweenLimits++;
-  }
-
-  // ------------------------------------------------
-  // 3. Return toward D5 in 100 equal timed portions
-  // ------------------------------------------------
-  digitalWrite(DIR_PIN, HIGH);
-
-  long totalStepsMoved = 0;
-  bool limit2Released = false;
-
-  for (int portion = 1; portion <= NUMBER_OF_PORTIONS; portion++) {
-
-    // Makes all 100 portions add up to exactly stepsBetweenLimits.
-    long targetSteps =
-        (stepsBetweenLimits * portion) / NUMBER_OF_PORTIONS;
-
-    long stepsThisPortion = targetSteps - totalStepsMoved;
-
-    for (long step = 0; step < stepsThisPortion; step++) {
-
-      // Stop immediately if either limit is touched.
-      // D18 is ignored only until the motor has moved away from it.
-      if (limitTouched(LIMIT_1_PIN) ||
-          (limit2Released && limitTouched(LIMIT_2_PIN))) {
-        stopForever();
-      }
-
-      takeOneStep();
-      totalStepsMoved++;
-
-      // Once D18 is no longer pressed, start monitoring it too.
-      if (!limitTouched(LIMIT_2_PIN)) {
-        limit2Released = true;
-      }
-    }
-
-    delay(1000);  // Wait one second before the next 1/100 movement
-  }
-
-  // At this point the motor should have arrived at D5.
-  // Stop as a safety measure if D5 was not detected.
-  stopForever();
+Serial.println("Calibration complete. All axes are home.");
+Serial.println("Waiting 3 seconds before first input...");
+delay(INPUT_DELAY_MS);
+printPrompt();
 }
 
 void loop() {
-  // The complete sequence runs only once after reset/upload.
+while (Serial.available() > 0) {
+char character = Serial.read();
+if (character != '\r' && character != '\n') {
+if (inputBuffer.length() < 63) {
+inputBuffer += character;
+Serial.print(character);
+}
+continue;
 }
 
+if (inputBuffer.length() == 0) continue;
+Serial.println();
+String input = inputBuffer;
+inputBuffer = "";
+input.trim();
+input.replace("(", "");
+input.replace(")", "");
+input.trim();
+
+if (input == "1") {
+  bool ok = runSample1();
+  stopAll();
+  if (!ok) Serial.println("Sample 1 stopped.");
+} else {
+  int comma1 = input.indexOf(',');
+  int comma2 = input.indexOf(',', comma1 + 1);
+  if (comma1 == -1 || comma2 == -1 ||
+      input.indexOf(',', comma2 + 1) != -1) {
+    Serial.println("Invalid format. Example: 100,-50,25");
+  } else {
+    String xText = input.substring(0, comma1);
+    String yText = input.substring(comma1 + 1, comma2);
+    String zText = input.substring(comma2 + 1);
+    xText.trim(); yText.trim(); zText.trim();
+
+    long xSteps = 0, ySteps = 0, zSteps = 0;
+    if (!parseSignedSteps(xText, xSteps) ||
+        !parseSignedSteps(yText, ySteps) ||
+        !parseSignedSteps(zText, zSteps)) {
+      Serial.println("Invalid input. Use signed WHOLE pulse counts.");
+    } else {
+      const int64_t targetX = (int64_t)currentXSteps + xSteps;
+      const int64_t targetY = (int64_t)currentYSteps + ySteps;
+      const int64_t targetZ = (int64_t)currentZSteps + zSteps;
+      if (targetX < 0 || targetX > (int64_t)xMaxSteps ||
+          targetY < 0 || targetY > (int64_t)yMaxSteps ||
+          targetZ < 0 || targetZ > (int64_t)zMaxSteps) {
+        Serial.println("ERROR: Requested endpoint outside calibrated travel.");
+      } else {
+        Serial.println("Moving X, then Y, then Z (exact pulses)...");
+        // Do not move the next axis if a switch or timeout stops this one.
+        bool ok = moveXForSteps(xSteps);
+        if (ok) ok = moveYForSteps(ySteps);
+        if (ok) ok = moveZForSteps(zSteps);
+        stopAll();
+        if (ok) Serial.println("Movement complete.");
+        else Serial.println("Interrupted. Check switches and re-home if needed.");
+      }
+    }
+  }
+}
+
+Serial.println("Waiting 3 seconds before next input...");
+delay(INPUT_DELAY_MS);
+printPrompt();
+
+}
+}
