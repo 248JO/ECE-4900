@@ -4,7 +4,7 @@
 // Set TB6600 DIP switches for 200 pulses/revolution for a 200-full-step motor.
 // X has two motors that both receive the same pulse; Y and Z have one each.
 // Serial command changes to X(pulses),Y(pulses),Z(pulses).
-// Y commanded movement now uses stepY() pulses rather than continuous PWM.
+// Y commanded movement now uses stepY() pulses rather than continuous PWM..
 
 #include <Arduino.h>
 #include <stdlib.h>
