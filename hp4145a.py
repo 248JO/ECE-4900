@@ -101,6 +101,7 @@ class HP4145A:
         self._channels_applied = False
         self._sweep_applied = False
         self._last_sweep_points = None
+        self._time_applied = False
 
     def __enter__(self) -> "HP4145A":
         try:
@@ -271,6 +272,81 @@ class HP4145A:
         self._sweep_applied = self.allow_configuration
         self._last_sweep_points = point_count
         return self._configuration_write(cmd)
+
+    def configure_current_time(
+        self,
+        *,
+        current_limit_a: float,
+        interval: float = 2.0,
+        readings: int = 15,
+        wait: float = 1.0,
+        fixture_verified: bool = False,
+        smu1_voltage_name: str = "V1",
+        smu1_current_name: str = "I1",
+        smu3_voltage_name: str = "V3",
+        smu3_current_name: str = "I3",
+    ) -> list[str]:
+        """Configure current-versus-time measurement at 0 V.
+
+        Preview by default. Sending requires explicit authorization
+        and verification of the physical measurement setup.
+        """
+        names = [
+            smu1_voltage_name, smu1_current_name,
+            smu3_voltage_name, smu3_current_name,
+        ]
+        if any(not _NAME.fullmatch(name) for name in names):
+            raise ValueError("Channel names must be 1-6 ASCII letters/digits/underscore")
+        if len({name.upper() for name in names}) != len(names):
+            raise ValueError("Channel names must be unique")
+        if not 0 < current_limit_a <= 0.1:
+            raise ValueError("Current limit must be within 0 to 0.1 A")
+        if not 0.01 <= interval <= 10:
+            raise ValueError("Interval must be 0.01 to 10 seconds")
+        if not 1 <= readings <= 512:
+            raise ValueError("Readings must be between 1 and 512")
+        if not 0 <= wait <= 100:
+            raise ValueError("Wait time must be 0 to 100 seconds")
+
+        commands = [
+            f"DE CH1,'{smu1_voltage_name}','{smu1_current_name}',1,3;"
+            f"CH2;CH3,'{smu3_voltage_name}','{smu3_current_name}',3,3;"
+            "CH4;VS1;VS2;VM1;VM2",
+            f"SS VC1,0,{current_limit_a:.6g}",
+            f"SM WT{wait:.2f};IN{interval:.2f};NR{readings};DM1",
+        ]
+
+        # Reset the ready flag before any new configuration attempt.
+        self._time_applied = False
+        if self.allow_configuration:
+            if not fixture_verified:
+                raise HP4145AError(
+                    "Configuration not sent: fixture verification required"
+                )
+            for command in commands:
+                self._send(command)
+            self._time_applied = True
+
+        return commands
+
+    def measure_current_time(
+        self,
+        *,
+        fixture_verified: bool = False,
+        timeout: float = 60.0,
+    ) -> int:
+        """Start one previously configured time-domain acquisition."""
+        if not self.allow_configuration:
+            raise HP4145AError("Remote measurement not enabled")
+        if not self._time_applied:
+            raise HP4145AError(
+                "Apply the time-domain configuration in this session before measuring"
+            )
+        if not fixture_verified:
+            raise HP4145AError("Fixture verification required")
+
+        self._send("MD ME1")
+        return self.wait_data_ready(timeout=timeout)
 
     def set_integration_time(self, mode: str = "MEDIUM") -> str:
         codes = {"SHORT": "IT1", "MEDIUM": "IT2", "LONG": "IT3"}
